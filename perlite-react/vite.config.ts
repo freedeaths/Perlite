@@ -95,7 +95,7 @@ export default defineConfig(({ mode }) => {
             } else if (req.url?.startsWith('/api/file')) {
               try {
                 const url = new URL(req.url, `http://${req.headers.host}`);
-                const filePath = url.searchParams.get('path');
+                const filePath = decodeURIComponent(url.searchParams.get('path') || '');
                 
                 if (!filePath) {
                   res.statusCode = 400;
@@ -107,41 +107,87 @@ export default defineConfig(({ mode }) => {
                   throw new Error('VITE_VAULT_PATH is not set');
                 }
 
-                const fullPath = path.join(vaultPath, filePath);
+                // 处理文件路径中的分隔符
+                const normalizedPath = filePath.split(/[/\\]/).join(path.sep);
+                const fullPath = path.join(vaultPath, normalizedPath);
+                console.log('Attempting to read file:', {
+                  originalPath: filePath,
+                  normalizedPath,
+                  fullPath
+                });
                 
                 // 安全检查：确保请求的文件在 vault 目录内
                 const normalizedFullPath = path.normalize(fullPath);
                 const normalizedVaultPath = path.normalize(vaultPath);
                 
                 if (!normalizedFullPath.startsWith(normalizedVaultPath)) {
+                  console.error('Access denied - file outside vault:', {
+                    normalizedFullPath,
+                    normalizedVaultPath
+                  });
                   res.statusCode = 403;
                   res.end(JSON.stringify({ error: 'Access denied' }));
                   return;
                 }
 
                 if (!fs.existsSync(fullPath)) {
+                  // 尝试查找可能的文件名
+                  const dir = path.dirname(fullPath);
+                  const basename = path.basename(fullPath);
+                  console.error('File not found, checking directory:', {
+                    dir,
+                    basename,
+                    exists: fs.existsSync(dir)
+                  });
+
+                  if (fs.existsSync(dir)) {
+                    const files = fs.readdirSync(dir);
+                    console.log('Files in directory:', files);
+                  }
+
                   res.statusCode = 404;
-                  res.end(JSON.stringify({ error: 'File not found' }));
+                  res.end(JSON.stringify({ error: 'File not found', path: fullPath }));
                   return;
                 }
 
-                // 检查文件类型
+                // 检查文件类型和大小
+                const stat = fs.statSync(fullPath);
                 const mimeType = mime.lookup(fullPath) || 'application/octet-stream';
                 const isImage = mimeType.startsWith('image/');
                 const isMarkdown = mimeType === 'text/markdown' || fullPath.endsWith('.md');
 
+                console.log('File info:', {
+                  path: fullPath,
+                  size: stat.size,
+                  mimeType,
+                  isImage,
+                  isMarkdown
+                });
+
                 if (isImage) {
-                  // 如果是图片，直接返回图片数据
-                  const imageData = fs.readFileSync(fullPath);
+                  // 如果是图片，使用 stream 来处理大文件
                   res.setHeader('Content-Type', mimeType);
-                  res.end(imageData);
+                  res.setHeader('Content-Length', stat.size);
+                  res.setHeader('Cache-Control', 'public, max-age=31536000'); // 缓存一年
+                  
+                  const stream = fs.createReadStream(fullPath);
+                  
+                  stream.on('error', (error) => {
+                    console.error('Stream error:', error);
+                    if (!res.headersSent) {
+                      res.statusCode = 500;
+                      res.end(JSON.stringify({ error: 'Failed to read image file' }));
+                    }
+                  });
+
+                  stream.pipe(res);
                 } else if (isMarkdown) {
                   // 如果是 Markdown 文件，返回文本内容
                   const content = fs.readFileSync(fullPath, 'utf-8');
                   res.setHeader('Content-Type', 'application/json');
                   res.end(JSON.stringify({ content }));
                 } else {
-                  // 其他文件类型
+                  console.error('Unsupported file type:', mimeType);
                   res.statusCode = 415;
                   res.end(JSON.stringify({ error: 'Unsupported file type' }));
                 }
@@ -162,5 +208,14 @@ export default defineConfig(({ mode }) => {
         }
       }
     ],
+    server: {
+      hmr: {
+        protocol: 'ws',
+        host: 'localhost'
+      },
+      watch: {
+        usePolling: true
+      }
+    }
   }
 })
